@@ -24,11 +24,14 @@
 
 #include <config.h>
 
-#include <process.h>
 #include <stdio.h>
 
 #include "libusbi.h"
 #include "windows_common.h"
+
+#if defined(LIBUSB_WINDOWS_HOTPLUG)
+#include "windows_hotplug.h"
+#endif
 
 #define EPOCH_TIME	UINT64_C(116444736000000000)	// 1970.01.01 00:00:000 in MS Filetime
 
@@ -95,6 +98,35 @@ const char *windows_error_str(DWORD error_code)
 }
 #endif
 
+/*
+ * Dynamically loads a DLL from the Windows system directory.  Unlike the
+ * LoadLibraryA() function, this function will not search through any
+ * directories to try and find the library.
+ */
+HMODULE load_system_library(struct libusb_context *ctx, const char *name)
+{
+	char library_path[MAX_PATH];
+	char *filename_start;
+	UINT length;
+
+	length = GetSystemDirectoryA(library_path, sizeof(library_path));
+	if ((length == 0) || (length >= (UINT)sizeof(library_path))) {
+		usbi_err(ctx, "program assertion failed - could not get system directory");
+		return NULL;
+	}
+
+	filename_start = library_path + length;
+	// Append '\' + name + ".dll" + NUL
+	length += 1 + (UINT)strlen(name) + 4 + 1;
+	if (length >= (UINT)sizeof(library_path)) {
+		usbi_err(ctx, "program assertion failed - library path buffer overflow");
+		return NULL;
+	}
+
+	sprintf(filename_start, "\\%s.dll", name);
+	return LoadLibraryA(library_path);
+}
+
 /* Hash table functions - modified From glibc 2.3.2:
    [Aho,Sethi,Ullman] Compilers: Principles, Techniques and Tools, 1986
    [Knuth]            The Art of Computer Programming, part 3 (6.4)  */
@@ -124,7 +156,7 @@ static bool htab_create(struct libusb_context *ctx)
 	// Create a mutex
 	usbi_mutex_init(&htab_mutex);
 
-	usbi_dbg("using %lu entries hash table", HTAB_SIZE);
+	usbi_dbg(ctx, "using %lu entries hash table", HTAB_SIZE);
 	htab_filled = 0;
 
 	// allocate memory and zero out.
@@ -193,7 +225,7 @@ unsigned long htab_hash(const char *str)
 		if ((htab_table[idx].used == hval) && (strcmp(str, htab_table[idx].str) == 0))
 			goto out_unlock; // existing hash
 
-		usbi_dbg("hash collision ('%s' vs '%s')", str, htab_table[idx].str);
+		usbi_dbg(NULL, "hash collision ('%s' vs '%s')", str, htab_table[idx].str);
 
 		// Second hash function, as suggested in [Knuth]
 		hval2 = 1UL + hval % (HTAB_SIZE - 2);
@@ -251,11 +283,12 @@ enum libusb_transfer_status usbd_status_to_libusb_transfer_status(USBD_STATUS st
 	case USBD_STATUS_CANCELED:
 		return LIBUSB_TRANSFER_CANCELLED;
 	case USBD_STATUS_ENDPOINT_HALTED:
+	case USBD_STATUS_STALL_PID:
 		return LIBUSB_TRANSFER_STALL;
 	case USBD_STATUS_DEVICE_GONE:
 		return LIBUSB_TRANSFER_NO_DEVICE;
 	default:
-		usbi_dbg("USBD_STATUS 0x%08lx translated to LIBUSB_TRANSFER_ERROR", ULONG_CAST(status));
+		usbi_dbg(NULL, "USBD_STATUS 0x%08lx translated to LIBUSB_TRANSFER_ERROR", ULONG_CAST(status));
 		return LIBUSB_TRANSFER_ERROR;
 	}
 }
@@ -265,15 +298,18 @@ enum libusb_transfer_status usbd_status_to_libusb_transfer_status(USBD_STATUS st
  */
 void windows_force_sync_completion(struct usbi_transfer *itransfer, ULONG size)
 {
+	struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
+	struct windows_context_priv *priv = usbi_get_context_priv(TRANSFER_CTX(transfer));
 	struct windows_transfer_priv *transfer_priv = usbi_get_transfer_priv(itransfer);
 	OVERLAPPED *overlapped = &transfer_priv->overlapped;
 
-	usbi_dbg("transfer %p, length %lu", USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer), size);
+	usbi_dbg(TRANSFER_CTX(transfer), "transfer %p, length %lu", transfer, ULONG_CAST(size));
 
 	overlapped->Internal = (ULONG_PTR)STATUS_SUCCESS;
 	overlapped->InternalHigh = (ULONG_PTR)size;
 
-	usbi_signal_transfer_completion(itransfer);
+	if (!PostQueuedCompletionStatus(priv->completion_port, (DWORD)size, (ULONG_PTR)transfer->dev_handle, overlapped))
+		usbi_err(TRANSFER_CTX(transfer), "failed to post I/O completion: %s", windows_error_str(0));
 }
 
 /* Windows version detection */
@@ -300,6 +336,9 @@ static enum windows_version get_windows_version(void)
 	const char *w, *arch;
 	bool ws;
 
+#ifndef ENABLE_LOGGING
+	UNUSED(w); UNUSED(arch);
+#endif
 	memset(&vi, 0, sizeof(vi));
 	vi.dwOSVersionInfoSize = sizeof(vi);
 	if (!GetVersionExA((OSVERSIONINFOA *)&vi)) {
@@ -315,6 +354,8 @@ static enum windows_version get_windows_version(void)
 	if ((vi.dwMajorVersion > 6) || ((vi.dwMajorVersion == 6) && (vi.dwMinorVersion >= 2))) {
 		// Starting with Windows 8.1 Preview, GetVersionEx() does no longer report the actual OS version
 		// See: http://msdn.microsoft.com/en-us/library/windows/desktop/dn302074.aspx
+		// And starting with Windows 10 Preview 2, Windows enforces the use of the application/supportedOS
+		// manifest in order for VerSetConditionMask() to report the ACTUAL OS major and minor...
 
 		major_equal = VerSetConditionMask(0, VER_MAJORVERSION, VER_EQUAL);
 		for (major = vi.dwMajorVersion; major <= 9; major++) {
@@ -350,6 +391,7 @@ static enum windows_version get_windows_version(void)
 
 	ws = (vi.wProductType <= VER_NT_WORKSTATION);
 	version = vi.dwMajorVersion << 4 | vi.dwMinorVersion;
+
 	switch (version) {
 	case 0x50: winver = WINDOWS_2000;  w = "2000"; break;
 	case 0x51: winver = WINDOWS_XP;	   w = "XP";   break;
@@ -359,22 +401,30 @@ static enum windows_version get_windows_version(void)
 	case 0x62: winver = WINDOWS_8;	   w = (ws ? "8" : "2012");	 break;
 	case 0x63: winver = WINDOWS_8_1;   w = (ws ? "8.1" : "2012_R2"); break;
 	case 0x64: // Early Windows 10 Insider Previews and Windows Server 2017 Technical Preview 1 used version 6.4
-	case 0xA0: winver = WINDOWS_10;	   w = (ws ? "10" : "2016");	 break;
+	case 0xA0: winver = WINDOWS_10;	   w = (ws ? "10" : "2016");
+		   if (vi.dwBuildNumber < 20000)
+			   break;
+		   // fallthrough
+	case 0xB0: winver = WINDOWS_11;	   w = (ws ? "11" : "2022");	 break;
 	default:
 		if (version < 0x50)
 			return WINDOWS_UNDEFINED;
-		winver = WINDOWS_11_OR_LATER;
-		w = "11 or later";
+		winver = WINDOWS_12_OR_LATER;
+		w = "12 or later";
 	}
+
+	// We cannot tell if we are on 8, 10, or 11 without "app manifest"
+	if (version == 0x62 && vi.dwBuildNumber == 9200)
+		w = "8 (or later)";
 
 	arch = is_x64() ? "64-bit" : "32-bit";
 
 	if (vi.wServicePackMinor)
-		usbi_dbg("Windows %s SP%u.%u %s", w, vi.wServicePackMajor, vi.wServicePackMinor, arch);
+		usbi_dbg(NULL, "Windows %s SP%u.%u %s", w, vi.wServicePackMajor, vi.wServicePackMinor, arch);
 	else if (vi.wServicePackMajor)
-		usbi_dbg("Windows %s SP%u %s", w, vi.wServicePackMajor, arch);
+		usbi_dbg(NULL, "Windows %s SP%u %s", w, vi.wServicePackMajor, arch);
 	else
-		usbi_dbg("Windows %s %s", w, arch);
+		usbi_dbg(NULL, "Windows %s %s", w, arch);
 
 	return winver;
 }
@@ -387,10 +437,14 @@ static unsigned __stdcall windows_iocp_thread(void *arg)
 	DWORD num_bytes;
 	ULONG_PTR completion_key;
 	OVERLAPPED *overlapped;
+	struct libusb_device_handle *dev_handle;
+	struct libusb_device_handle *opened_device_handle;
+	struct windows_device_handle_priv *handle_priv;
 	struct windows_transfer_priv *transfer_priv;
 	struct usbi_transfer *itransfer;
+	bool found;
 
-	usbi_dbg("I/O completion thread started");
+	usbi_dbg(ctx, "I/O completion thread started");
 
 	while (true) {
 		overlapped = NULL;
@@ -406,14 +460,49 @@ static unsigned __stdcall windows_iocp_thread(void *arg)
 			break;
 		}
 
-		transfer_priv = container_of(overlapped, struct windows_transfer_priv, overlapped);
-		itransfer = (struct usbi_transfer *)((unsigned char *)transfer_priv + PTR_ALIGN(sizeof(*transfer_priv)));
-		usbi_dbg("transfer %p completed, length %lu",
-			 USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer), ULONG_CAST(num_bytes));
+		// Find the transfer associated with the OVERLAPPED that just completed.
+		// If we cannot find a match, the I/O operation originated from outside of libusb
+		// (e.g. within libusbK) and we need to ignore it.
+		dev_handle = (struct libusb_device_handle *)completion_key;
+
+		found = false;
+		transfer_priv = NULL;
+
+		// Issue 912: lock opened device handles in context to search the current device handle
+		// to avoid accessing unallocated memory after device has been closed
+		usbi_mutex_lock(&ctx->open_devs_lock);
+		for_each_open_device(ctx, opened_device_handle) {
+			if (dev_handle == opened_device_handle) {
+				handle_priv = usbi_get_device_handle_priv(dev_handle);
+
+				usbi_mutex_lock(&dev_handle->lock);
+				list_for_each_entry(transfer_priv, &handle_priv->active_transfers, list, struct windows_transfer_priv) {
+					if (overlapped == &transfer_priv->overlapped) {
+						// This OVERLAPPED belongs to us, remove the transfer from the device handle's list
+						list_del(&transfer_priv->list);
+						found = true;
+						break;
+					}
+				}
+				usbi_mutex_unlock(&dev_handle->lock);
+			}
+		}
+		usbi_mutex_unlock(&ctx->open_devs_lock);
+
+		if (!found) {
+			usbi_dbg(ctx, "ignoring overlapped %p for handle %p",
+				 overlapped, dev_handle);
+			continue;
+		}
+
+		itransfer = TRANSFER_PRIV_TO_USBI_TRANSFER(transfer_priv);
+		struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
+		usbi_dbg(ctx, "transfer %p completed, length %lu",
+			 transfer, ULONG_CAST(num_bytes));
 		usbi_signal_transfer_completion(itransfer);
 	}
 
-	usbi_dbg("I/O completion thread exiting");
+	usbi_dbg(ctx, "I/O completion thread exiting");
 
 	return 0;
 }
@@ -421,25 +510,8 @@ static unsigned __stdcall windows_iocp_thread(void *arg)
 static int windows_init(struct libusb_context *ctx)
 {
 	struct windows_context_priv *priv = usbi_get_context_priv(ctx);
-	char mutex_name[11 + 8 + 1]; // strlen("libusb_init") + (32-bit hex PID) + '\0'
-	HANDLE mutex;
 	bool winusb_backend_init = false;
 	int r;
-
-	sprintf(mutex_name, "libusb_init%08lX", ULONG_CAST(GetCurrentProcessId() & 0xFFFFFFFFU));
-	mutex = CreateMutexA(NULL, FALSE, mutex_name);
-	if (mutex == NULL) {
-		usbi_err(ctx, "could not create mutex: %s", windows_error_str(0));
-		return LIBUSB_ERROR_NO_MEM;
-	}
-
-	// A successful wait gives this thread ownership of the mutex
-	// => any concurrent wait stalls until the mutex is released
-	if (WaitForSingleObject(mutex, INFINITE) != WAIT_OBJECT_0) {
-		usbi_err(ctx, "failure to access mutex: %s", windows_error_str(0));
-		CloseHandle(mutex);
-		return LIBUSB_ERROR_NO_MEM;
-	}
 
 	// NB: concurrent usage supposes that init calls are equally balanced with
 	// exit calls. If init is called more than exit, we will not exit properly
@@ -467,7 +539,7 @@ static int windows_init(struct libusb_context *ctx)
 
 		r = usbdk_backend.init(ctx);
 		if (r == LIBUSB_SUCCESS) {
-			usbi_dbg("UsbDk backend is available");
+			usbi_dbg(ctx, "UsbDk backend is available");
 			usbdk_available = true;
 		} else {
 			usbi_info(ctx, "UsbDk backend is not available");
@@ -497,6 +569,18 @@ static int windows_init(struct libusb_context *ctx)
 
 	r = LIBUSB_SUCCESS;
 
+#if defined(LIBUSB_WINDOWS_HOTPLUG)
+	if (init_count == 1) {
+		r = windows_start_event_monitor(); // Start-up hotplug event handler
+		if (r != LIBUSB_SUCCESS) {
+			usbi_err(ctx, "error starting hotplug event monitor");
+			goto init_exit;
+		}
+	}
+
+	windows_initial_scan_devices(ctx);
+#endif
+
 init_exit: // Holds semaphore here
 	if ((init_count == 1) && (r != LIBUSB_SUCCESS)) { // First init failed?
 		if (usbdk_available) {
@@ -509,29 +593,12 @@ init_exit: // Holds semaphore here
 		--init_count;
 	}
 
-	ReleaseMutex(mutex);
-	CloseHandle(mutex);
 	return r;
 }
 
 static void windows_exit(struct libusb_context *ctx)
 {
 	struct windows_context_priv *priv = usbi_get_context_priv(ctx);
-	char mutex_name[11 + 8 + 1]; // strlen("libusb_init") + (32-bit hex PID) + '\0'
-	HANDLE mutex;
-
-	sprintf(mutex_name, "libusb_init%08lX", ULONG_CAST(GetCurrentProcessId() & 0xFFFFFFFFU));
-	mutex = CreateMutexA(NULL, FALSE, mutex_name);
-	if (mutex == NULL)
-		return;
-
-	// A successful wait gives this thread ownership of the mutex
-	// => any concurrent wait stalls until the mutex is released
-	if (WaitForSingleObject(mutex, INFINITE) != WAIT_OBJECT_0) {
-		usbi_err(ctx, "failed to access mutex: %s", windows_error_str(0));
-		CloseHandle(mutex);
-		return;
-	}
 
 	// A NULL completion status will indicate to the thread that it is time to exit
 	if (!PostQueuedCompletionStatus(priv->completion_port, 0, (ULONG_PTR)ctx, NULL))
@@ -545,6 +612,9 @@ static void windows_exit(struct libusb_context *ctx)
 
 	// Only works if exits and inits are balanced exactly
 	if (--init_count == 0) { // Last exit
+#if defined(LIBUSB_WINDOWS_HOTPLUG)
+		windows_stop_event_monitor();
+#endif
 		if (usbdk_available) {
 			usbdk_backend.exit(ctx);
 			usbdk_available = false;
@@ -552,9 +622,6 @@ static void windows_exit(struct libusb_context *ctx)
 		winusb_backend.exit(ctx);
 		htab_destroy();
 	}
-
-	ReleaseMutex(mutex);
-	CloseHandle(mutex);
 }
 
 static int windows_set_option(struct libusb_context *ctx, enum libusb_option option, va_list ap)
@@ -563,30 +630,43 @@ static int windows_set_option(struct libusb_context *ctx, enum libusb_option opt
 
 	UNUSED(ap);
 
-	switch ((int)option) {
-	case LIBUSB_OPTION_USE_USBDK:
-		if (usbdk_available) {
-			usbi_dbg("switching context %p to use UsbDk backend", ctx);
-			priv->backend = &usbdk_backend;
-		} else {
+	if (option == LIBUSB_OPTION_USE_USBDK) {
+		if (!usbdk_available) {
 			usbi_err(ctx, "UsbDk backend not available");
 			return LIBUSB_ERROR_NOT_FOUND;
 		}
+		usbi_dbg(ctx, "switching context %p to use UsbDk backend", ctx);
+		priv->backend = &usbdk_backend;
 		return LIBUSB_SUCCESS;
-	default:
-		return LIBUSB_ERROR_NOT_SUPPORTED;
 	}
+
+	return LIBUSB_ERROR_NOT_SUPPORTED;
 }
 
+#if !defined(LIBUSB_WINDOWS_HOTPLUG)
 static int windows_get_device_list(struct libusb_context *ctx, struct discovered_devs **discdevs)
 {
 	struct windows_context_priv *priv = usbi_get_context_priv(ctx);
 	return priv->backend->get_device_list(ctx, discdevs);
 }
+#endif
+
+static int windows_get_device_string(libusb_device *dev,
+	enum libusb_device_string_type string_type, char *data, int length)
+{
+	struct windows_context_priv* priv = usbi_get_context_priv(DEVICE_CTX(dev));
+	if (NULL != priv->backend->get_device_string) {
+		return priv->backend->get_device_string(dev, string_type, data, length);
+	}
+	return LIBUSB_ERROR_NOT_SUPPORTED;
+}
 
 static int windows_open(struct libusb_device_handle *dev_handle)
 {
 	struct windows_context_priv *priv = usbi_get_context_priv(HANDLE_CTX(dev_handle));
+	struct windows_device_handle_priv *handle_priv = usbi_get_device_handle_priv(dev_handle);
+
+	list_init(&handle_priv->active_transfers);
 	return priv->backend->open(dev_handle);
 }
 
@@ -668,11 +748,44 @@ static void windows_destroy_device(struct libusb_device *dev)
 	priv->backend->destroy_device(dev);
 }
 
+static int windows_endpoint_supports_raw_io(libusb_device_handle* dev_handle,
+	uint8_t endpoint)
+{
+	struct windows_context_priv *priv = usbi_get_context_priv(HANDLE_CTX(dev_handle));
+	if (priv->backend->endpoint_supports_raw_io)
+		return priv->backend->endpoint_supports_raw_io(dev_handle, endpoint);
+	return LIBUSB_ERROR_NOT_SUPPORTED;
+}
+
+static int windows_endpoint_set_raw_io(libusb_device_handle* dev_handle,
+	uint8_t endpoint, int enable)
+{
+	struct windows_context_priv *priv = usbi_get_context_priv(HANDLE_CTX(dev_handle));
+
+	if (priv->backend->endpoint_supports_raw_io == NULL
+		|| priv->backend->endpoint_supports_raw_io(dev_handle, endpoint) != 1
+		|| priv->backend->endpoint_set_raw_io == NULL)
+		return LIBUSB_ERROR_NOT_SUPPORTED;
+
+	return priv->backend->endpoint_set_raw_io(dev_handle, endpoint, enable);
+}
+
+static int windows_get_max_raw_io_transfer_size(struct libusb_device_handle *dev_handle,
+	uint8_t endpoint)
+{
+	struct windows_context_priv *priv = usbi_get_context_priv(HANDLE_CTX(dev_handle));
+	if (priv->backend->get_max_raw_io_transfer_size)
+		return priv->backend->get_max_raw_io_transfer_size(dev_handle, endpoint);
+	return LIBUSB_ERROR_NOT_SUPPORTED;
+}
+
 static int windows_submit_transfer(struct usbi_transfer *itransfer)
 {
 	struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
-	struct libusb_context *ctx = TRANSFER_CTX(transfer);
+	struct libusb_device_handle *dev_handle = transfer->dev_handle;
+	struct libusb_context *ctx = HANDLE_CTX(dev_handle);
 	struct windows_context_priv *priv = usbi_get_context_priv(ctx);
+	struct windows_device_handle_priv *handle_priv = usbi_get_device_handle_priv(dev_handle);
 	struct windows_transfer_priv *transfer_priv = usbi_get_transfer_priv(itransfer);
 	int r;
 
@@ -695,8 +808,18 @@ static int windows_submit_transfer(struct usbi_transfer *itransfer)
 		transfer_priv->handle = NULL;
 	}
 
+	// Add transfer to the device handle's list
+	usbi_mutex_lock(&dev_handle->lock);
+	list_add_tail(&transfer_priv->list, &handle_priv->active_transfers);
+	usbi_mutex_unlock(&dev_handle->lock);
+
 	r = priv->backend->submit_transfer(itransfer);
 	if (r != LIBUSB_SUCCESS) {
+		// Remove the unsuccessful transfer from the device handle's list
+		usbi_mutex_lock(&dev_handle->lock);
+		list_del(&transfer_priv->list);
+		usbi_mutex_unlock(&dev_handle->lock);
+
 		// Always call the backend's clear_transfer_priv() function on failure
 		priv->backend->clear_transfer_priv(itransfer);
 		transfer_priv->handle = NULL;
@@ -745,33 +868,34 @@ static int windows_handle_transfer_completion(struct usbi_transfer *itransfer)
 	else
 		result = GetLastError();
 
-	usbi_dbg("handling transfer %p completion with errcode %lu, length %lu",
-		 USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer), ULONG_CAST(result), ULONG_CAST(bytes_transferred));
+	struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
+	usbi_dbg(ctx, "handling transfer %p completion with errcode %lu, length %lu",
+		 transfer, ULONG_CAST(result), ULONG_CAST(bytes_transferred));
 
 	switch (result) {
 	case NO_ERROR:
 		status = backend->copy_transfer_data(itransfer, bytes_transferred);
 		break;
 	case ERROR_GEN_FAILURE:
-		usbi_dbg("detected endpoint stall");
+		usbi_dbg(ctx, "detected endpoint stall");
 		status = LIBUSB_TRANSFER_STALL;
 		break;
 	case ERROR_SEM_TIMEOUT:
-		usbi_dbg("detected semaphore timeout");
+		usbi_dbg(ctx, "detected semaphore timeout");
 		status = LIBUSB_TRANSFER_TIMED_OUT;
 		break;
 	case ERROR_OPERATION_ABORTED:
 		istatus = backend->copy_transfer_data(itransfer, bytes_transferred);
 		if (istatus != LIBUSB_TRANSFER_COMPLETED)
-			usbi_dbg("failed to copy partial data in aborted operation: %d", (int)istatus);
+			usbi_dbg(ctx, "failed to copy partial data in aborted operation: %d", (int)istatus);
 
-		usbi_dbg("detected operation aborted");
+		usbi_dbg(ctx, "detected operation aborted");
 		status = LIBUSB_TRANSFER_CANCELLED;
 		break;
 	case ERROR_FILE_NOT_FOUND:
 	case ERROR_DEVICE_NOT_CONNECTED:
 	case ERROR_NO_SUCH_DEVICE:
-		usbi_dbg("detected device removed");
+		usbi_dbg(ctx, "detected device removed");
 		status = LIBUSB_TRANSFER_NO_DEVICE;
 		break;
 	default:
@@ -792,6 +916,7 @@ static int windows_handle_transfer_completion(struct usbi_transfer *itransfer)
 		return usbi_handle_transfer_completion(itransfer, status);
 }
 
+#ifndef HAVE_CLOCK_GETTIME
 void usbi_get_monotonic_time(struct timespec *tp)
 {
 	static LONG hires_counter_init;
@@ -816,6 +941,7 @@ void usbi_get_monotonic_time(struct timespec *tp)
 	tp->tv_sec = (long)(hires_counter.QuadPart / hires_frequency);
 	tp->tv_nsec = (long)(((hires_counter.QuadPart % hires_frequency) * hires_ticks_to_ps) / UINT64_C(1000));
 }
+#endif
 
 // NB: MSVC6 does not support named initializers.
 const struct usbi_os_backend usbi_backend = {
@@ -824,7 +950,12 @@ const struct usbi_os_backend usbi_backend = {
 	windows_init,
 	windows_exit,
 	windows_set_option,
+#if defined(LIBUSB_WINDOWS_HOTPLUG)
+	NULL, /* get_device_list */
+#else
 	windows_get_device_list,
+#endif
+	windows_get_device_string,
 	NULL,	/* hotplug_poll */
 	NULL,	/* wrap_sys_device */
 	windows_open,
@@ -846,6 +977,9 @@ const struct usbi_os_backend usbi_backend = {
 	NULL,	/* kernel_driver_active */
 	NULL,	/* detach_kernel_driver */
 	NULL,	/* attach_kernel_driver */
+	windows_endpoint_supports_raw_io,
+	windows_endpoint_set_raw_io,
+	windows_get_max_raw_io_transfer_size,
 	windows_destroy_device,
 	windows_submit_transfer,
 	windows_cancel_transfer,
@@ -854,6 +988,6 @@ const struct usbi_os_backend usbi_backend = {
 	windows_handle_transfer_completion,
 	sizeof(struct windows_context_priv),
 	sizeof(union windows_device_priv),
-	sizeof(union windows_device_handle_priv),
+	sizeof(struct windows_device_handle_priv),
 	sizeof(struct windows_transfer_priv),
 };

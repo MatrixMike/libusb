@@ -20,6 +20,7 @@ OS_DARWIN_SRC = os/darwin_usb.h os/darwin_usb.c
 OS_HAIKU_SRC = os/haiku_usb.h os/haiku_usb_backend.cpp \
 	       os/haiku_pollfs.cpp os/haiku_usb_raw.h os/haiku_usb_raw.cpp
 OS_LINUX_SRC = os/linux_usbfs.h os/linux_usbfs.c
+OS_EMSCRIPTEN_SRC = os/emscripten_webusb.cpp
 OS_NETBSD_SRC = os/netbsd_usb.c
 OS_NULL_SRC = os/null_usb.c
 OS_OPENBSD_SRC = os/openbsd_usb.c
@@ -29,12 +30,18 @@ OS_WINDOWS_SRC = libusb-1.0.def libusb-1.0.rc \
 		 os/windows_usbdk.h os/windows_usbdk.c \
 		 os/windows_winusb.h os/windows_winusb.c
 
+if LIBUSB_WINDOWS_HOTPLUG
+OS_WINDOWS_SRC += os/windows_hotplug.h os/windows_hotplug.c
+endif	 
+
 if OS_DARWIN
 OS_SRC = $(OS_DARWIN_SRC)
 endif
 
+noinst_LTLIBRARIES =
+
 if OS_HAIKU
-noinst_LTLIBRARIES = libusb_haiku.la
+noinst_LTLIBRARIES += libusb_haiku.la
 libusb_haiku_la_SOURCES = $(OS_HAIKU_SRC)
 libusb_1_0_la_LIBADD = libusb_haiku.la
 endif
@@ -46,6 +53,13 @@ OS_SRC += os/linux_udev.c
 else
 OS_SRC += os/linux_netlink.c
 endif
+endif
+
+if OS_EMSCRIPTEN
+noinst_LTLIBRARIES += libusb_emscripten.la
+libusb_emscripten_la_SOURCES = $(OS_EMSCRIPTEN_SRC)
+AM_CXXFLAGS += -std=c++20
+libusb_1_0_la_LIBADD = libusb_emscripten.la
 endif
 
 if OS_NETBSD
@@ -80,9 +94,9 @@ all-local: .libs/libusb-1.0.dll.a
 endif
 endif
 
-libusb_1_0_la_LDFLAGS = $(LT_LDFLAGS)
+libusb_1_0_la_LDFLAGS = $(LT_LDFLAGS) $(EXTRA_LDFLAGS)
 libusb_1_0_la_SOURCES = libusbi.h version.h version_nano.h \
-	core.c descriptor.c hotplug.h hotplug.c io.c strerror.c sync.c \
+	core.c descriptor.c hotplug.c io.c strerror.c sync.c \
 	$(PLATFORM_SRC) $(OS_SRC)
 
 pkginclude_HEADERS = libusb.h

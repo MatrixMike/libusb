@@ -27,7 +27,6 @@
 #include <stdio.h>
 
 #include "libusbi.h"
-#include "windows_common.h"
 #include "windows_usbdk.h"
 
 #if !defined(STATUS_SUCCESS)
@@ -81,7 +80,7 @@ static void unload_usbdk_helper_dll(void)
 
 static int load_usbdk_helper_dll(struct libusb_context *ctx)
 {
-	usbdk_helper.module = LoadLibraryA("UsbDkHelper");
+	usbdk_helper.module = load_system_library(ctx, "UsbDkHelper");
 	if (usbdk_helper.module == NULL) {
 		usbi_err(ctx, "Failed to load UsbDkHelper.dll: %s", windows_error_str(0));
 		return LIBUSB_ERROR_NOT_FOUND;
@@ -160,7 +159,7 @@ static int usbdk_init(struct libusb_context *ctx)
 	SC_HANDLE serviceHandle;
 	HMODULE h;
 
-	h = LoadLibraryA("Advapi32");
+	h = load_system_library(ctx, "Advapi32");
 	if (h == NULL) {
 		usbi_warn(ctx, "failed to open Advapi32\n");
 		return LIBUSB_ERROR_OTHER;
@@ -344,15 +343,17 @@ static int usbdk_get_device_list(struct libusb_context *ctx, struct discovered_d
 			}
 		}
 
-		discdevs = discovered_devs_append(*_discdevs, dev);
-		libusb_unref_device(dev);
-		if (!discdevs) {
-			usbi_err(ctx, "cannot append new device to list");
-			r = LIBUSB_ERROR_NO_MEM;
-			goto func_exit;
-		}
+		if (_discdevs) {
+			discdevs = discovered_devs_append(*_discdevs, dev);
+			libusb_unref_device(dev);
+			if (!discdevs) {
+				usbi_err(ctx, "cannot append new device to list");
+				r = LIBUSB_ERROR_NO_MEM;
+				goto func_exit;
+			}
 
-		*_discdevs = discdevs;
+			*_discdevs = discdevs;
+		}
 	}
 
 func_exit:
@@ -414,7 +415,7 @@ static int usbdk_open(struct libusb_device_handle *dev_handle)
 
 	device_priv->system_handle = usbdk_helper.GetRedirectorSystemHandle(device_priv->redirector_handle);
 
-	if (CreateIoCompletionPort(device_priv->system_handle, priv->completion_port, 0, 0) == NULL) {
+	if (CreateIoCompletionPort(device_priv->system_handle, priv->completion_port, (ULONG_PTR)dev_handle, 0) == NULL) {
 		usbi_err(ctx, "failed to associate handle to I/O completion port: %s", windows_error_str(0));
 		usbdk_helper.StopRedirect(device_priv->redirector_handle);
 		device_priv->system_handle = NULL;
@@ -705,6 +706,7 @@ const struct windows_backend usbdk_backend = {
 	usbdk_init,
 	usbdk_exit,
 	usbdk_get_device_list,
+	NULL,  /* usbdk_get_device_string */
 	usbdk_open,
 	usbdk_close,
 	usbdk_get_active_config_descriptor,
@@ -722,4 +724,7 @@ const struct windows_backend usbdk_backend = {
 	NULL,	/* cancel_transfer */
 	usbdk_clear_transfer_priv,
 	usbdk_copy_transfer_data,
+	NULL,	/* endpoint_supports_raw_io */
+	NULL,	/* endpoint_set_raw_io */
+	NULL,	/* get_max_raw_io_transfer_size */
 };

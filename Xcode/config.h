@@ -8,12 +8,6 @@
 /* Define to 1 to enable message logging. */
 #define ENABLE_LOGGING 1
 
-/* On 10.12 and later, use newly available clock_*() functions */
-#if MAC_OS_X_VERSION_MIN_REQUIRED >= 101200
-/* Define to 1 if you have the `clock_gettime' function. */
-#define HAVE_CLOCK_GETTIME 1
-#endif
-
 /* On 10.6 and later, use newly available pthread_threadid_np() function */
 #if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
 /* Define to 1 if you have the 'pthread_threadid_np' function. */
@@ -28,6 +22,10 @@
 
 /* Define to 1 if compiling for a POSIX platform. */
 #define PLATFORM_POSIX 1
+
+/* Define to the attribute for enabling parameter checks on printf-like
+   functions. */
+#define PRINTF_FORMAT(a, b) __attribute__ ((__format__ (__printf__, a, b)))
 
 /* Enable GNU extensions. */
 #define _GNU_SOURCE 1
